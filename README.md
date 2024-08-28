@@ -14,7 +14,8 @@ The Automated Aquaculture Tank Monitoring System is designed to provide real-tim
 This project aims to contribute to the sustainability and efficiency of the aquaculture industry by offering a comprehensive solution that enhances productivity, improves operational efficiency, and safeguards fish health.
 
 ![Prototype of the user interface](Images/prototype.jpeg)
-![Protoype of the feeder](Images/feeder with stand.jpeg)
+![Prototype of the feeder](Images/feeder with stand.jpeg)
+
 
 ## Table of Contents
 
