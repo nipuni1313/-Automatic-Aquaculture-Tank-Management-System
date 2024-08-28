@@ -1,0 +1,91 @@
+
+//-----------------------------for lcd-------------------
+// Initializes the Two-Wire Interface (TWI/I2C) hardware.
+void TWI_init(void) {
+	TWSR = 0x00;
+	TWBR = 0x48;  // Set bit rate register (for 16MHz)
+	TWCR = (1 << TWEN);  // Enable TWI
+}
+
+//indicating the beginning of a communication session.
+void TWI_start(void) {
+	TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);  // Send start condition
+	while (!(TWCR & (1 << TWINT)));  // Wait for TWINT flag
+}
+
+//Sends a stop condition on the I2C bus, indicating the end of a communication session.
+void TWI_stop(void) {
+	TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);  // Send stop condition
+	while (TWCR & (1 << TWSTO));  // Wait for stop to complete
+}
+
+//Writes a byte of data to the I2C bus.
+void TWI_write(uint8_t data) {
+	TWDR = data;  // Load data into TWDR
+	TWCR = (1 << TWINT) | (1 << TWEN);  // Start transmission
+	while (!(TWCR & (1 << TWINT)));  // Wait for TWINT flag
+}
+
+//Sends data or commands to the LCD via I2C.
+void lcd_send(uint8_t value, uint8_t mode) {
+	TWI_start();  // Start I2C communication
+	TWI_write(LCD_ADDR << 1);  // Write LCD address
+
+	uint8_t data = (value & 0xF0) | mode | 0x08;  // Send upper nibble
+	TWI_write(data);
+	TWI_write(data | 0x04);  // Pulse the enable bit
+	_delay_us(1);  // Small delay to ensure proper timing
+	TWI_write(data & ~0x04);
+
+	data = ((value << 4) & 0xF0) | mode | 0x08;  // Send lower nibble
+	TWI_write(data);
+	TWI_write(data | 0x04);  // Pulse the enable bit
+	_delay_us(1);  // Small delay to ensure proper timing
+	TWI_write(data & ~0x04);
+
+	TWI_stop();  // Stop I2C communication
+}
+
+//Sends a command byte to the LCD.
+void lcd_command(uint8_t command) {
+	lcd_send(command, 0);
+	_delay_ms(5);  // Increase delay to ensure the command is processed
+}
+
+//Sends a data byte to the LCD.
+void lcd_data(uint8_t data) {
+	lcd_send(data, 1);
+	_delay_ms(5);  // Increase delay to ensure the data is processed
+}
+
+// Initializes the LCD display for use in 4-bit mode.
+void lcd_init(void) {
+	_delay_ms(50);  // Wait for LCD to power up
+	lcd_command(0x33);  // Initialize LCD in 8-bit mode (twice to ensure it resets)
+	lcd_command(0x32);  // Set to 4-bit mode
+	lcd_command(0x28);  // Function set: 4-bit mode, 2 lines, 5x8 dots (used for 4-line displays)
+	lcd_command(0x0C);  // Display on, cursor off, blink off
+	lcd_command(0x06);  // Entry mode set: Increment cursor, no display shift
+	lcd_command(0x01);  // Clear display
+	_delay_ms(5);  // Ensure the display is cleared
+}
+
+//Sets the cursor position on the LCD to a specific row and column.
+void lcd_set_cursor(uint8_t row, uint8_t col) {
+	uint8_t address;
+	switch (row) {
+		case 0: address = 0x80 + col; break; // Row 1, offset 0x00
+		case 1: address = 0xC0 + col; break; // Row 2, offset 0x40
+		case 2: address = 0x94 + col; break; // Row 3, offset 0x14
+		case 3: address = 0xD4 + col; break; // Row 4, offset 0x54
+		default: address = 0x80 + col; break; // Default to Row 1
+	}
+	lcd_command(address);
+}
+
+//Prints a string of characters on the LCD starting at the current cursor position.
+void lcd_print(char* str) {
+	while (*str) {
+		lcd_data(*str++);
+	}
+}
