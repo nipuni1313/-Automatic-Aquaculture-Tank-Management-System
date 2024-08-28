@@ -1,0 +1,711 @@
+#define F_CPU 16000000UL  // 16 MHz clock speed
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <stdio.h>  // Include for sprintf function
+#include <stdlib.h>
+#include <stdbool.h>
+#include <math.h>
+
+
+#define PB_cancel PD6  // Replace with the actual pin number
+#define PB_OK PD3      // Replace with the actual pin number
+#define PB_UP PD4      // Replace with the actual pin number
+#define PB_DOWN PD5
+
+#define LCD_ADDR 0x27  // Adjust this if your I2C address is different
+
+#define DS18B20_PORT PORTB
+#define DS18B20_DDR DDRB
+#define DS18B20_PIN PINB
+#define DS18B20_DQ PB0  // Data pin connected to PB0
+
+#define DEBOUNCE_DELAY 5  // 50 milliseconds
+
+//motor
+#define MOTOR_CONTROL_BUTTON PD2  // Pin D9 corresponds to PB1
+#define MOTOR_PIN PD7  // Pin D7 corresponds to PD7
+
+// for tempreature
+int h_temp = 25;
+int l_temp = 2;
+int T;
+
+bool cancel_pressed = false;
+
+//for tds
+float tdsMinValue = 300;
+float tdsMaxValue = 1000;
+
+//for Ph
+float calibration_value = 21.34;
+
+int current_mode = 0, max_modes = 4; // Increased max_modes for additional sensor
+char* modes[] = {"1- Temp range", "2- pH range", "3- TDS range", "4- Set motor time"};
+//char temp[32];
+
+
+// Function prototypes
+void TWI_init(void);
+void TWI_start(void);
+void TWI_stop(void);
+void TWI_write(uint8_t data);
+void lcd_send(uint8_t value, uint8_t mode);
+void lcd_command(uint8_t command);
+void lcd_data(uint8_t data);
+void lcd_init(void);
+void lcd_set_cursor(uint8_t row, uint8_t col);
+void lcd_print(char* str);
+void print_line(char* text, uint8_t col, uint8_t row);
+void go_to_menu(void);
+void set_temp_range(void);
+void set_tds_range(void);
+void time_update(void);
+void run_mode(int mode);
+void sensor_check_temp(void);
+bool read_cancel_button();
+void Conductivity();
+void adc_init();
+void ph();
+
+
+//temp
+void ds18b20_write_bit(uint8_t bit);
+uint8_t ds18b20_read_bit(void);
+void ds18b20_write_byte(uint8_t byte) ;
+uint8_t ds18b20_read_byte(void);
+uint8_t ds18b20_reset(void);
+float ds18b20_get_temperature(void);
+
+//tds
+float tds;
+static bool motorState = false;
+
+ISR(INT1_vect) {
+	_delay_ms(20);
+	go_to_menu();
+}
+
+ISR(INT0_vect) {
+	// Debounce delay
+	_delay_ms(1);
+	
+	// Toggle motor state
+	motorState = !motorState;
+	
+	// Update motor and display
+	if (motorState) {
+		PORTD |= (1 << MOTOR_PIN);  // Turn motor on
+		} else {
+		PORTD &= ~(1 << MOTOR_PIN); // Turn motor off
+	}
+}
+
+
+int main(void) {
+		
+	TWI_init();   // Initialize TWI (I2C) and LCD and adc
+	lcd_init();
+	adc_init();
+	
+	DDRD &= ~((1 << PB_cancel) | (1 << PB_OK) | (1 << PB_UP) | (1 << PB_DOWN)); // Set as input
+	
+	// Configure INT1 (Pin D3) for falling edge trigger
+	EICRA |= (1 << ISC11); // ISC11 = 1, ISC10 = 0 for falling edge
+	EICRA &= ~(1 << ISC10);
+	// Enable INT1 interrupt
+	EIMSK |= (1 << INT1);
+
+	// Configure INT0 (Pin D2) for falling edge trigger
+	EICRA |= (1 << ISC01); // ISC01 = 1, ISC00 = 0 for falling edge
+	EICRA &= ~(1 << ISC00);
+
+	// Enable INT0 interrupt
+	EIMSK |= (1 << INT0);  //EIMSK: This is the External Interrupt Mask Register in AVR microcontrollers. It controls which external interrupts are enabled or disabled.
+	//the specific bit corresponding to INT0 in the EIMSK register is set to 1
+
+	// Enable global interrupts
+	sei();
+	
+	lcd_set_cursor(1, 1);
+	lcd_print("AQUA CULTURE");
+	lcd_set_cursor(2, 1);
+	lcd_print("Fish feeder");
+	_delay_ms(200);
+	
+	lcd_command(0x01); // Clear display
+	print_line("welcome!", 0, 0);
+	_delay_ms(200);
+	lcd_command(0x01); // Clear display
+	
+
+	//motor
+	// Set MOTOR_PIN as output and MOTOR_CONTROL_BUTTON as input
+	DDRD |= (1 << MOTOR_PIN);          // Set PD7 as output
+	DDRD &= ~(1 << MOTOR_CONTROL_BUTTON); // Set PD6 as input	
+	PORTD |= (1 << MOTOR_CONTROL_BUTTON);// Enable pull-up resistor for MOTOR_CONTROL_BUTTON
+	
+	// Variable to store motor state
+	//uint8_t motorState = 0; // Motor off initially
+		
+	while (1) {  // Main loop
+
+		sensor_check_temp();
+		Conductivity();
+	
+}
+}
+
+//----------code for menu---------
+void print_line(char* text, uint8_t col, uint8_t row) {//8 bits wide. Because it is "unsigned,
+	lcd_set_cursor(row, col);
+	lcd_print(text);
+}
+
+
+
+int wait_for_button_press(void) {
+	int button = -1;  // Initialize to an invalid value
+	while (1) {
+		if (!(PIND & (1 << PB_UP))) {
+			_delay_ms(DEBOUNCE_DELAY);
+			if (!(PIND & (1 << PB_UP))) { //second check ensures that the button press was intentional and not accidental
+				button = PB_UP;
+				break;
+			}
+			} else if (!(PIND & (1 << PB_DOWN))) {
+			_delay_ms(DEBOUNCE_DELAY);
+			if (!(PIND & (1 << PB_DOWN))) {
+				button = PB_DOWN;
+				break;
+			}
+			} else if (!(PIND & (1 << PB_OK))) {
+			_delay_ms(DEBOUNCE_DELAY);
+			if (!(PIND & (1 << PB_OK))) {
+				button = PB_OK;
+				break;
+			}
+			} else if (!(PIND & (1 << PB_cancel))) {
+			_delay_ms(DEBOUNCE_DELAY);
+			if (!(PIND & (1 << PB_cancel))) {
+				button = PB_cancel;
+				break;
+			}
+		}
+	}
+	return button;
+}
+
+
+
+void go_to_menu(void) {
+	while (PIND & (1 << PB_cancel)) {
+		lcd_command(0x01); // Clear display
+		print_line(modes[current_mode], 0, 0);
+		uint8_t pressed = wait_for_button_press();
+		_delay_ms(100);
+
+		if (pressed == PB_UP) {
+			_delay_ms(20);
+			current_mode -= 1;
+			if (current_mode < 0) {
+				current_mode = max_modes - 1;
+			}
+			} else if (pressed == PB_DOWN) {
+			_delay_ms(20);
+			current_mode += 1;
+			current_mode = current_mode % max_modes;
+			} else if (pressed == PB_OK) {
+			_delay_ms(20);
+			run_mode(current_mode);
+			} else if (pressed == PB_cancel) {
+			_delay_ms(20);
+			break;
+		}
+	}
+	lcd_command(0x01); // Clear display
+}
+
+// Set temperature range
+void set_temp_range(void) {
+	int entered_h_temp = h_temp;
+	while (1) {
+		lcd_command(0x01); // Clear display
+		print_line("high temp: ", 0, 0);
+		char buffer[16];
+		snprintf(buffer, sizeof(buffer), "%d", entered_h_temp);
+		print_line(buffer, 12, 0);
+		uint8_t pressed = wait_for_button_press();
+		
+		if (pressed == PB_UP) {
+			_delay_ms(20);
+			entered_h_temp += 1;
+			entered_h_temp = entered_h_temp % 41;
+			} else if (pressed == PB_DOWN) {
+			_delay_ms(20);
+			entered_h_temp -= 1;
+			if (entered_h_temp < 25) {
+				entered_h_temp = 40;
+			}
+			} else if (pressed == PB_OK) {
+			_delay_ms(20);
+			h_temp = entered_h_temp;
+			break;
+			} else if (pressed == PB_cancel) {
+			_delay_ms(20);
+			break;
+		}
+	}
+
+	int entered_l_temp = l_temp;
+	while (1) {
+		lcd_command(0x01); // Clear display
+		print_line("lowest temp: ", 0, 0);
+		char buffer[16];
+		snprintf(buffer, sizeof(buffer), "%d", entered_l_temp);
+		print_line(buffer, 14, 0);
+		uint8_t pressed = wait_for_button_press();
+		
+		if (pressed == PB_UP) {
+			_delay_ms(20);
+			entered_l_temp += 1;
+			entered_l_temp = entered_l_temp % 41;
+			} else if (pressed == PB_DOWN) {
+			_delay_ms(20);
+			entered_l_temp -= 1;
+			if (entered_l_temp < 25) {
+				entered_l_temp = 40;
+			}
+			} else if (pressed == PB_OK) {
+			_delay_ms(20);
+			l_temp = entered_l_temp;
+			break;
+			} else if (pressed == PB_cancel) {
+			_delay_ms(20);
+			break;
+		}
+	}
+}
+//-----------TDS range-----------
+void set_tds_range(void) {
+	int entered_h_tds = tdsMaxValue;
+	while (1) {
+		lcd_command(0x01); // Clear display
+		print_line("high tds: ", 0, 0);
+		char buffer[16];
+		snprintf(buffer, sizeof(buffer), "%d", entered_h_tds);
+		print_line(buffer, 12, 0);
+		uint8_t pressed = wait_for_button_press();
+		
+		if (pressed == PB_UP) {
+			_delay_ms(20);
+			entered_h_tds += 1;
+			entered_h_tds = entered_h_tds % 11;
+			} else if (pressed == PB_DOWN) {
+			_delay_ms(20);
+			entered_h_tds -= 1;
+			if (entered_h_tds < 2) {
+				entered_h_tds = 10;
+			}
+			} else if (pressed == PB_OK) {
+			_delay_ms(20);
+			tdsMaxValue = entered_h_tds;
+			break;
+			} else if (pressed == PB_cancel) {
+			_delay_ms(20);
+			break;
+		}
+	}
+
+	int entered_l_tds = l_temp;
+	while (1) {
+		lcd_command(0x01); // Clear display
+		print_line("lowest tds: ", 0, 0);
+		char buffer[16];
+		snprintf(buffer, sizeof(buffer), "%d", entered_l_tds);
+		print_line(buffer, 14, 0);
+		uint8_t pressed = wait_for_button_press();
+		
+		if (pressed == PB_UP) {
+			_delay_ms(20);
+			entered_l_tds += 1;
+			entered_l_tds = entered_l_tds % 11;
+			} else if (pressed == PB_DOWN) {
+			_delay_ms(20);
+			entered_l_tds -= 1;
+			if (entered_l_tds < 2) {
+				entered_l_tds = 10;
+			}
+			} else if (pressed == PB_OK) {
+			_delay_ms(20);
+			tdsMinValue = entered_l_tds;
+			break;
+			} else if (pressed == PB_cancel) {
+			_delay_ms(20);
+			break;
+		}
+	}
+}
+
+
+void run_mode(int mode) {
+	if (mode == 0) {
+		set_temp_range();
+		} else if (mode == 1) {
+		set_temp_range();  // You need to implement this function
+		} else if (mode == 2) {
+		set_temp_range(); // You need to implement this function
+		} else if (mode == 3) {
+		set_temp_range();
+		
+		// Placeholder for future functionalities
+	}
+}
+//-----------temp check--------
+void sensor_check_temp(void){
+	char temp[32];
+	T=ds18b20_get_temperature();
+	sprintf(temp, "Temp: %d.%02d C", T / 100, T % 100);
+	//
+	// Print formatted temperature value
+	lcd_set_cursor(2, -4);
+	lcd_print(temp);
+	lcd_set_cursor(0, 0);
+	//lcd_print("before loop");
+	// 			_delay_ms(5000);
+
+	if (!cancel_pressed) {
+		if (T / 100 > h_temp) {
+			bool break_happened = false;
+			while (!break_happened && !read_cancel_button()) {
+				snprintf(temp, sizeof(temp), "Temp high %d.%02dC", T / 100, T % 100);
+				print_line(temp, 0, 0);
+
+				if (read_cancel_button()) {
+					break_happened = true;
+					cancel_pressed = true;
+					lcd_command(0x01);
+					break;
+				}
+			}
+		}
+
+		if (T / 100 < l_temp) {
+			bool break_happened = false;
+			while (!break_happened && !read_cancel_button()) {
+				snprintf(temp, sizeof(temp), "Temp low %d.%02dC", T / 100, T % 100);
+				//lcd_command(0x01);
+				print_line(temp, 0, 0);
+
+				if (read_cancel_button()) {
+					//_delay_ms(200);
+					break_happened = true;
+					cancel_pressed = true;
+					lcd_command(0x01);
+					break;
+				}
+			}
+		}
+	}
+	else {
+		lcd_command(0x01);
+		cancel_pressed = false;
+	}
+}
+//_delay_ms(2000);
+//}
+
+bool read_cancel_button() {
+
+	if (!(PIND & (1 << PB_cancel))){
+		_delay_ms(DEBOUNCE_DELAY);
+		if (!(PIND & (1 << PB_cancel))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//----------------for temp-------------
+void ds18b20_write_bit(uint8_t bit) { //for a bit 1 or 0
+	DS18B20_DDR |= (1<<DS18B20_DQ); // sets the data pin (DQ) as an output.
+	//if bit=1
+	if(bit) {
+		DS18B20_PORT &= ~(1<<DS18B20_DQ);  // data line DQ is Pulled low
+		_delay_us(10);
+		DS18B20_PORT |= (1<<DS18B20_DQ);  // Release the line
+		_delay_us(55);
+		} 
+		//if bit=0
+		else {
+		DS18B20_PORT &= ~(1<<DS18B20_DQ);  // Pull the line low
+		_delay_us(65);
+		DS18B20_PORT |= (1<<DS18B20_DQ);  // Release the line
+		_delay_us(5);
+	}//------------------This timing conforms to the 1-Wire protocol specifications for writing bits to the DS18B20.-----------
+}
+
+uint8_t ds18b20_read_bit(void) {
+	uint8_t bit = 0;
+	DS18B20_DDR |= (1<<DS18B20_DQ); // Set pin (data line) as output
+	DS18B20_PORT &= ~(1<<DS18B20_DQ);  // Pull the data line low for 3 miliseconds
+	_delay_us(3);
+	DS18B20_DDR &= ~(1<<DS18B20_DQ); // Set pin as input
+	_delay_us(10);
+	bit = (DS18B20_PIN & (1<<DS18B20_DQ));  // Read the pin after 10 miliseconds
+	_delay_us(50);
+	return (bit > 0);
+}
+
+// writes a byte of data (8 bits) to the DS18B20 sensor.
+void ds18b20_write_byte(uint8_t byte) {
+	for (uint8_t i = 0; i < 8; i++) {
+		ds18b20_write_bit(byte & 0x01);
+		byte >>= 1;
+	}
+}
+
+// reads a byte of data (8 bits) from the DS18B20 sensor.
+uint8_t ds18b20_read_byte(void) {
+	uint8_t byte = 0;
+	for (uint8_t i = 0; i < 8; i++) {
+		byte >>= 1;
+		if(ds18b20_read_bit()) {
+			byte |= 0x80;
+		}
+	}
+	return byte;
+}
+
+//sends a reset pulse to the DS18B20 sensor and checks for a presence pulse, indicating the sensor is connected and ready to communicate.
+uint8_t ds18b20_reset(void) {
+	DS18B20_DDR |= (1<<DS18B20_DQ); // Set pin as output
+	DS18B20_PORT &= ~(1<<DS18B20_DQ);  // Pull the line low (signals rest) for 480 microseconds
+	_delay_us(480);  // Delay for 480us
+	DS18B20_DDR &= ~(1<<DS18B20_DQ); // Set pin as input
+	_delay_us(70);  // Delay for 70us
+	uint8_t presence = !(DS18B20_PIN & (1<<DS18B20_DQ));  // after 70 microseconds release of data line Check for presence (The function returns 1 if the presence pulse is detected (sensor present) or 0 if not.)
+	_delay_us(410);  // Wait for the remainder of the time
+	return presence;
+}
+
+float ds18b20_get_temperature(void) {
+	if (!ds18b20_reset()) {
+		return -127;  // Error: No sensor detected ------(Calls ds18b20_reset() to check if the sensor is connected. If not, it returns -127 as an error code.)
+	}
+	
+	ds18b20_write_byte(0xCC);  // Skip ROM command
+	ds18b20_write_byte(0x44);  // Convert T command
+	
+	_delay_ms(750);  // Wait for temperature conversion
+	//
+	ds18b20_reset();
+	ds18b20_write_byte(0xCC);  // Skip ROM command
+	ds18b20_write_byte(0xBE);  // Read Scratchpad command
+	
+	uint8_t lsb = ds18b20_read_byte();
+	uint8_t msb = ds18b20_read_byte();//Reads two bytes of data (lsb and msb) which represent the temperature.
+	int16_t rawTemperature = (msb << 8) | lsb;//Combines these bytes into a 16-bit signed integer (rawTemperature).
+	
+	
+	
+	// Convert raw value to Celsius
+	float temperature = rawTemperature / 16.0;
+	
+	// Debug: Print formatted temperature value
+	int fixed_temp = (int)(temperature * 100);
+	return fixed_temp;
+}
+
+
+
+//-----------------------------for lcd-------------------
+// Initializes the Two-Wire Interface (TWI/I2C) hardware.
+void TWI_init(void) {
+	TWSR = 0x00;
+	TWBR = 0x48;  // Set bit rate register (for 16MHz)
+	TWCR = (1 << TWEN);  // Enable TWI
+}
+
+//indicating the beginning of a communication session.
+void TWI_start(void) {
+	TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);  // Send start condition
+	while (!(TWCR & (1 << TWINT)));  // Wait for TWINT flag
+}
+
+//Sends a stop condition on the I2C bus, indicating the end of a communication session.
+void TWI_stop(void) {
+	TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);  // Send stop condition
+	while (TWCR & (1 << TWSTO));  // Wait for stop to complete
+}
+
+//Writes a byte of data to the I2C bus.
+void TWI_write(uint8_t data) {
+	TWDR = data;  // Load data into TWDR
+	TWCR = (1 << TWINT) | (1 << TWEN);  // Start transmission
+	while (!(TWCR & (1 << TWINT)));  // Wait for TWINT flag
+}
+
+//Sends data or commands to the LCD via I2C.
+void lcd_send(uint8_t value, uint8_t mode) {
+	TWI_start();  // Start I2C communication
+	TWI_write(LCD_ADDR << 1);  // Write LCD address
+
+	uint8_t data = (value & 0xF0) | mode | 0x08;  // Send upper nibble
+	TWI_write(data);
+	TWI_write(data | 0x04);  // Pulse the enable bit
+	_delay_us(1);  // Small delay to ensure proper timing
+	TWI_write(data & ~0x04);
+
+	data = ((value << 4) & 0xF0) | mode | 0x08;  // Send lower nibble
+	TWI_write(data);
+	TWI_write(data | 0x04);  // Pulse the enable bit
+	_delay_us(1);  // Small delay to ensure proper timing
+	TWI_write(data & ~0x04);
+
+	TWI_stop();  // Stop I2C communication
+}
+
+//Sends a command byte to the LCD.
+void lcd_command(uint8_t command) {
+	lcd_send(command, 0);
+	_delay_ms(5);  // Increase delay to ensure the command is processed
+}
+
+//Sends a data byte to the LCD.
+void lcd_data(uint8_t data) {
+	lcd_send(data, 1);
+	_delay_ms(5);  // Increase delay to ensure the data is processed
+}
+
+// Initializes the LCD display for use in 4-bit mode.
+void lcd_init(void) {
+	_delay_ms(50);  // Wait for LCD to power up
+	lcd_command(0x33);  // Initialize LCD in 8-bit mode (twice to ensure it resets)
+	lcd_command(0x32);  // Set to 4-bit mode
+	lcd_command(0x28);  // Function set: 4-bit mode, 2 lines, 5x8 dots (used for 4-line displays)
+	lcd_command(0x0C);  // Display on, cursor off, blink off
+	lcd_command(0x06);  // Entry mode set: Increment cursor, no display shift
+	lcd_command(0x01);  // Clear display
+	_delay_ms(5);  // Ensure the display is cleared
+}
+
+//Sets the cursor position on the LCD to a specific row and column.
+void lcd_set_cursor(uint8_t row, uint8_t col) {
+	uint8_t address;
+	switch (row) {
+		case 0: address = 0x80 + col; break; // Row 1, offset 0x00
+		case 1: address = 0xC0 + col; break; // Row 2, offset 0x40
+		case 2: address = 0x94 + col; break; // Row 3, offset 0x14
+		case 3: address = 0xD4 + col; break; // Row 4, offset 0x54
+		default: address = 0x80 + col; break; // Default to Row 1
+	}
+	lcd_command(address);
+}
+
+//Prints a string of characters on the LCD starting at the current cursor position.
+void lcd_print(char* str) {
+	while (*str) {
+		lcd_data(*str++);
+	}
+}
+
+//----------ADC-----------
+// ADC functions
+//Set up the ADC for reading analog signals and configure its reference voltage and prescaler.
+void adc_init() {
+	// Set the ADC reference to AVcc with external capacitor at AREF pin
+	ADMUX = (1 << REFS0); //(ADMUX is the ADC multiplexer register that selects the reference voltage and input channel.)
+
+	// Set the ADC prescaler to 128 for an 8MHz clock to get an ADC clock of 62.5kHz
+	// (recommended between 50kHz and 200kHz for 10-bit resolution)
+	ADCSRA = (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+
+	// Enable the ADC
+	ADCSRA |= (1 << ADEN);
+}
+
+uint16_t adc_read(uint8_t channel) {
+	// Select the ADC channel (0-7) by clearing the lower 5 bits of ADMUX and setting the channel
+	ADMUX = (ADMUX & 0xF8) | (channel & 0x07);
+
+	// Start the conversion by setting the ADSC bit in ADCSRA
+	ADCSRA |= (1 << ADSC);
+
+	// Wait for the conversion to complete (ADSC becomes '0' again)
+	while (ADCSRA & (1 << ADSC));
+
+	// Return the ADC value from the ADC data registers (ADCL and ADCH)
+	return ADC;
+}
+
+
+
+//-----TDS---
+void Conductivity() {
+	float waterTemp = T/100;
+	float rawEc = adc_read(2) * 4.3 / 1024.0;
+	float temperatureCoefficient = 1.0 + 0.02 * (waterTemp - 25.0);
+	float ec = (rawEc / temperatureCoefficient);
+	float tdsss = (133.42 * pow(ec, 3) - 255.86 * ec * ec + 857.39 * ec) * 0.5;
+	tds=(tdsss/100)+4;
+	
+	char tdd[32];
+	
+	// Convert float to string
+	dtostrf(tds, 6, 2, tdd); // Convert float 'tds' to a string 'tdd' with 6 characters width and 2 decimal places
+	
+	lcd_set_cursor(3, -4);    // Set cursor position; adjust as needed
+	lcd_print("TDS: ");
+	lcd_print(tdd);
+
+}
+
+void ph(){
+	int buffer_arr[32];
+	int temp;
+	// Read analog values and store in buffer
+	for (int i = 0; i <100; i++) {
+		buffer_arr[i] = adc_read(3);  // Read from A3 (ADC channel 3)
+		_delay_ms(30);
+	}
+
+	// Sort buffer array using bubble sort
+	for (int i = 0; i < 99; i++) {
+		for (int j = i + 1; j < 100; j++) {
+			if (buffer_arr[i] > buffer_arr[j]) {
+				temp = buffer_arr[i];
+				buffer_arr[i] = buffer_arr[j];
+				buffer_arr[j] = temp;
+			}
+		}
+	}
+
+	// Calculate the average value excluding the lowest and highest values
+	unsigned long avgval = 0;
+	for (int i = 2; i < 98; i++) {
+		avgval += buffer_arr[i];
+	}
+
+	char debug_buffer[32];
+
+	// Use integer math for voltage calculation and display
+	unsigned long int volt_int = (avgval * 5.0) / 1024/46 ;///46;  // Convert to millivolts
+	float ph_act = (float)volt_int; // Convert voltage to pH calculation
+	ph_act = (-5.70 * volt_int + calibration_value)*100-(T);
+	// Convert float pH to integer representation for display
+	int ph_int = (int)ph_act;  // Integer part of pH
+
+
+	// Check and display pH value
+	if (ph_int < 0 || ph_int > 1400) {  // Check pH value in multiplied scale (0-1400)
+		print_line("Error calculating Ph!",1,0);
+		} else {
+		sprintf(debug_buffer, "pH: %d.%02d", ph_int / 100, ph_int % 100);  // Display pH as integer
+	}
+	lcd_set_cursor(1, 0);  // Set cursor to the third row, first column
+	lcd_print(debug_buffer);
+
+	_delay_ms(1000);
+
+}
