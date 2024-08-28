@@ -1,0 +1,93 @@
+
+//----------------for temp-------------
+void ds18b20_write_bit(uint8_t bit) { //for a bit 1 or 0
+	DS18B20_DDR |= (1<<DS18B20_DQ); // sets the data pin (DQ) as an output.
+	//if bit=1
+	if(bit) {
+		DS18B20_PORT &= ~(1<<DS18B20_DQ);  // data line DQ is Pulled low
+		_delay_us(10);
+		DS18B20_PORT |= (1<<DS18B20_DQ);  // Release the line
+		_delay_us(55);
+		} 
+		//if bit=0
+		else {
+		DS18B20_PORT &= ~(1<<DS18B20_DQ);  // Pull the line low
+		_delay_us(65);
+		DS18B20_PORT |= (1<<DS18B20_DQ);  // Release the line
+		_delay_us(5);
+	}//------------------This timing conforms to the 1-Wire protocol specifications for writing bits to the DS18B20.-----------
+}
+
+uint8_t ds18b20_read_bit(void) {
+	uint8_t bit = 0;
+	DS18B20_DDR |= (1<<DS18B20_DQ); // Set pin (data line) as output
+	DS18B20_PORT &= ~(1<<DS18B20_DQ);  // Pull the data line low for 3 miliseconds
+	_delay_us(3);
+	DS18B20_DDR &= ~(1<<DS18B20_DQ); // Set pin as input
+	_delay_us(10);
+	bit = (DS18B20_PIN & (1<<DS18B20_DQ));  // Read the pin after 10 miliseconds
+	_delay_us(50);
+	return (bit > 0);
+}
+
+// writes a byte of data (8 bits) to the DS18B20 sensor.
+void ds18b20_write_byte(uint8_t byte) {
+	for (uint8_t i = 0; i < 8; i++) {
+		ds18b20_write_bit(byte & 0x01);
+		byte >>= 1;
+	}
+}
+
+// reads a byte of data (8 bits) from the DS18B20 sensor.
+uint8_t ds18b20_read_byte(void) {
+	uint8_t byte = 0;
+	for (uint8_t i = 0; i < 8; i++) {
+		byte >>= 1;
+		if(ds18b20_read_bit()) {
+			byte |= 0x80;
+		}
+	}
+	return byte;
+}
+
+//sends a reset pulse to the DS18B20 sensor and checks for a presence pulse, indicating the sensor is connected and ready to communicate.
+uint8_t ds18b20_reset(void) {
+	DS18B20_DDR |= (1<<DS18B20_DQ); // Set pin as output
+	DS18B20_PORT &= ~(1<<DS18B20_DQ);  // Pull the line low (signals rest) for 480 microseconds
+	_delay_us(480);  // Delay for 480us
+	DS18B20_DDR &= ~(1<<DS18B20_DQ); // Set pin as input
+	_delay_us(70);  // Delay for 70us
+	uint8_t presence = !(DS18B20_PIN & (1<<DS18B20_DQ));  // after 70 microseconds release of data line Check for presence (The function returns 1 if the presence pulse is detected (sensor present) or 0 if not.)
+	_delay_us(410);  // Wait for the remainder of the time
+	return presence;
+}
+
+float ds18b20_get_temperature(void) {
+	if (!ds18b20_reset()) {
+		return -127;  // Error: No sensor detected ------(Calls ds18b20_reset() to check if the sensor is connected. If not, it returns -127 as an error code.)
+	}
+	
+	ds18b20_write_byte(0xCC);  // Skip ROM command
+	ds18b20_write_byte(0x44);  // Convert T command
+	
+	_delay_ms(750);  // Wait for temperature conversion
+	//
+	ds18b20_reset();
+	ds18b20_write_byte(0xCC);  // Skip ROM command
+	ds18b20_write_byte(0xBE);  // Read Scratchpad command
+	
+	uint8_t lsb = ds18b20_read_byte();
+	uint8_t msb = ds18b20_read_byte();//Reads two bytes of data (lsb and msb) which represent the temperature.
+	int16_t rawTemperature = (msb << 8) | lsb;//Combines these bytes into a 16-bit signed integer (rawTemperature).
+	
+	
+	
+	// Convert raw value to Celsius
+	float temperature = rawTemperature / 16.0;
+	
+	// Debug: Print formatted temperature value
+	int fixed_temp = (int)(temperature * 100);
+	return fixed_temp;
+}
+
+
